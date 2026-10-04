@@ -58,41 +58,57 @@ def sanitize_filename(title: str) -> str:
     return title or "video"
 
 
+def parse_timestamp_pair(line: str) -> tuple[str, str] | None:
+    """Return start/end if the line looks like '0:31 1:20' or '0:37-1:14'."""
+    tokens = line.replace(",", " ").replace("–", " ").replace("—", " ").split()
+    expanded: list[str] = []
+    for token in tokens:
+        if "-" in token and ":" in token:
+            expanded.extend(part for part in token.split("-") if part)
+        else:
+            expanded.append(token)
+    times = [token for token in expanded if TIMESTAMP_TOKEN_RE.match(token)]
+    if len(times) >= 2:
+        return times[0], times[1]
+    return None
+
+
 def parse_links_file(path: Path) -> list[dict]:
+    """Parse links.txt with or without blank lines between clips.
+
+    A clip is a title line, then a YouTube URL, then an optional timestamp line.
+    """
     if not path.exists():
         raise FileNotFoundError(f"Could not find {path}")
 
-    text = path.read_text(encoding="utf-8")
-    blocks = re.split(r"\n\s*\n", text.strip())
+    lines = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8-sig").splitlines()
+        if line.strip()
+    ]
     entries: list[dict] = []
+    pending_title: str | None = None
 
-    for index, block in enumerate(blocks, start=1):
-        lines = [line.strip() for line in block.splitlines() if line.strip()]
-        if not lines:
-            continue
-
-        url_line = next((line for line in lines if YOUTUBE_URL_RE.search(line)), None)
-        if not url_line:
-            print(f"Skipping section {index}: no YouTube URL found")
-            continue
-
-        url_match = YOUTUBE_URL_RE.search(url_line)
-        url = url_match.group(0).rstrip(").,]")
-
-        title_line = next((line for line in lines if line != url_line), None)
-        title = sanitize_filename(title_line or f"video_{index}")
-
-        start = end = None
-        for line in lines:
-            if line == url_line or line == title_line:
-                continue
-            tokens = line.replace(",", " ").replace("-", " ").split()
-            times = [tok for tok in tokens if TIMESTAMP_TOKEN_RE.match(tok)]
-            if len(times) >= 2:
-                start, end = times[0], times[1]
-                break
-
-        entries.append({"title": title, "url": url, "start": start, "end": end})
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        url_match = YOUTUBE_URL_RE.search(line)
+        if url_match:
+            url = url_match.group(0).rstrip(").,]")
+            title = sanitize_filename(pending_title or f"video_{len(entries) + 1}")
+            pending_title = None
+            start = end = None
+            if i + 1 < len(lines):
+                pair = parse_timestamp_pair(lines[i + 1])
+                if pair:
+                    start, end = pair
+                    i += 1
+            entries.append({"title": title, "url": url, "start": start, "end": end})
+        elif parse_timestamp_pair(line):
+            pass
+        else:
+            pending_title = line
+        i += 1
 
     if not entries:
         raise ValueError(f"No valid sections found in {path}")
@@ -155,7 +171,7 @@ def download_from_links_file(links_path: Path, output_dir: Path) -> int:
     entries = parse_links_file(links_path)
     print(f"Found {len(entries)} section(s) in {links_path.name}\n")
 
-    failures = 0
+    failed_titles: list[str] = []
     for i, entry in enumerate(entries, start=1):
         print("=" * 60)
         print(f"[{i}/{len(entries)}] {entry['title']}")
@@ -169,11 +185,19 @@ def download_from_links_file(links_path: Path, output_dir: Path) -> int:
                 end=entry["end"],
             )
         except Exception as exc:
-            failures += 1
+            failed_titles.append(entry["title"])
             print(f"FAILED: {entry['title']}\n{exc}\n", file=sys.stderr)
 
-    print(f"Finished. {len(entries) - failures} succeeded, {failures} failed.")
-    return failures
+    succeeded = len(entries) - len(failed_titles)
+    print(f"Finished. {succeeded} succeeded, {len(failed_titles)} failed.")
+    if failed_titles:
+        print("\nFailed titles:")
+        for title in failed_titles:
+            print(f"  - {title}")
+        failed_path = output_dir / "failed.txt"
+        failed_path.write_text("\n".join(failed_titles) + "\n", encoding="utf-8")
+        print(f"\nAlso saved to {failed_path}")
+    return len(failed_titles)
 
 
 def parse_args() -> argparse.Namespace:
